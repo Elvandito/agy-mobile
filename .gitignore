@@ -1,0 +1,21 @@
+# Rust build artifacts
+/target/
+
+# Android Gradle & NDK build outputs
+/android/.gradle/
+/android/build/
+/android/app/build/
+/android/app/src/main/jniLibs/
+/android/local.properties
+*.iml
+.idea/
+
+# Keystores & local secrets (never commit credentials)
+*.jks
+*.keystore
+*.env
+.env.*
+oauth_secrets.json
+
+# Downloaded CI artifacts kept locally if unpacked in scratch
+/dist-scratch/

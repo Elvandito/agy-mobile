@@ -1,0 +1,316 @@
+name: Android Multi-Arch Build & Verification
+
+on:
+  push:
+    branches: ["main", "master"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: android-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: Rust Tests + 4 NDK Targets + 5 APKs
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install Rust stable and all 4 Android targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: armv7-linux-androideabi,aarch64-linux-android,i686-linux-android,x86_64-linux-android
+          components: rustfmt,clippy
+
+      - name: Cache Cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android Platform 35, Build-Tools 35.0.0, and NDK r26d (API 21+)
+        run: |
+          yes | sdkmanager --licenses > /dev/null
+          sdkmanager "platforms;android-35" "build-tools;35.0.0" "ndk;26.3.11579264"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/26.3.11579264" >> "$GITHUB_ENV"
+          echo "$ANDROID_HOME/build-tools/35.0.0" >> "$GITHUB_PATH"
+
+      - name: Install cargo-ndk
+        run: |
+          curl -fsSL https://github.com/bbqsrc/cargo-ndk/releases/download/v3.5.4/cargo-ndk-x86_64-unknown-linux-musl.tar.gz | tar -xz -C "$HOME/.cargo/bin"
+          cargo ndk --version
+
+      - name: Run Rust unit and integration test suite
+        run: cargo test --workspace -- --nocapture
+
+      - name: Build native Rust libraries for ARMv7, ARM64, x86, and x86_64 (Android API 21)
+        run: |
+          cargo ndk \
+            -t armv7-linux-androideabi \
+            -t aarch64-linux-android \
+            -t i686-linux-android \
+            -t x86_64-linux-android \
+            --platform 21 \
+            -o android/app/src/main/jniLibs \
+            build --release -p agy-runtime
+          find android/app/src/main/jniLibs -type f -exec ls -lh {} +
+
+      - name: Generate launcher icons and ephemeral CI signing keystore
+        run: |
+          python3 scripts/generate-launcher-icons.py
+          KEYSTORE_FILE="$RUNNER_TEMP/agy-ci-release.jks"
+          keytool -genkeypair -v \
+            -keystore "$KEYSTORE_FILE" \
+            -alias agy_release \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass agymobile2026 -keypass agymobile2026 \
+            -dname "CN=AGY Mobile, OU=Mobile CLI, O=AGY, L=Mountain View, ST=CA, C=US"
+          echo "AGY_KEYSTORE_PATH=$KEYSTORE_FILE" >> "$GITHUB_ENV"
+          echo "AGY_KEYSTORE_PASSWORD=agymobile2026" >> "$GITHUB_ENV"
+          echo "AGY_KEY_ALIAS=agy_release" >> "$GITHUB_ENV"
+          echo "AGY_KEY_PASSWORD=agymobile2026" >> "$GITHUB_ENV"
+
+      - name: Set up Gradle 8.9
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+
+      - name: Build Android APKs with Gradle
+        working-directory: android
+        run: |
+          gradle --no-daemon assembleRelease
+
+      - name: Verify all 5 APKs (ELF32/64 headers, API 21 Bionic linkage, badging, signatures)
+        run: |
+          chmod +x scripts/collect-and-verify-apks.sh
+          ./scripts/collect-and-verify-apks.sh android/app/build/outputs/apk/release dist
+          for apk in dist/agy-mobile-*.apk; do
+            echo "--- Badging for $apk ---"
+            aapt2 dump badging "$apk" | grep -E "package:|sdkVersion:|targetSdkVersion:|native-code:"
+          done
+
+      - name: Upload APK artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: agy-mobile-apks
+          path: |
+            dist/agy-mobile-universal.apk
+            dist/agy-mobile-armv7.apk
+            dist/agy-mobile-arm64.apk
+            dist/agy-mobile-x86.apk
+            dist/agy-mobile-x86_64.apk
+          if-no-files-found: error
+
+  test-api21-32bit:
+    name: Test Android 5.0 (API 21, 32-bit x86, 1 GB RAM)
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download built APKs
+        uses: actions/download-artifact@v4
+        with:
+          name: agy-mobile-apks
+          path: dist
+
+      - name: Enable KVM on runner
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Boot Android 5.0 (API 21, 32-bit x86, 1024 MB RAM) and test APK
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 21
+          target: default
+          arch: x86
+          ram-size: 1024M
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -skin 480x800
+          disable-animations: true
+          script: |
+            mkdir -p screenshots-api21
+            adb wait-for-device
+            adb logcat -c
+
+            echo "=== Installing 32-bit agy-mobile-x86.apk on Android 5.0 (API 21) ==="
+            adb install -r dist/agy-mobile-x86.apk
+
+            echo "=== Launching MainActivity on API 21 ==="
+            adb shell am start -W -n dev.antigravity.mobile/.MainActivity
+            sleep 5
+            adb exec-out screencap -p > screenshots-api21/api21-32bit-terminal.png
+
+            echo "=== Triggering low-memory trim on 1 GB RAM API 21 device ==="
+            adb shell am send-trim-memory dev.antigravity.mobile RUNNING_CRITICAL || true
+            sleep 2
+
+            echo "=== Checking process is alive and crash-free on API 21 ==="
+            adb shell ps | grep dev.antigravity.mobile
+            if adb logcat -d | grep -E "FATAL EXCEPTION|UnsatisfiedLinkError|SIGSEGV"; then
+              echo "ERROR: Crash detected on Android API 21!" >&2
+              adb logcat -d | tail -n 80 >&2
+              exit 1
+            fi
+            ls -lh screenshots-api21/*.png
+
+      - name: Upload API 21 screenshot artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: agy-mobile-api21-proof
+          path: screenshots-api21/*.png
+          if-no-files-found: error
+
+  test-e2e-ui-and-screenshots:
+    name: E2E UI Click-Through, Persistence & Screenshots (1 GB RAM)
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download built APKs
+        uses: actions/download-artifact@v4
+        with:
+          name: agy-mobile-apks
+          path: dist
+
+      - name: Enable KVM on runner
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Boot 1 GB RAM Emulator, exercise all screens & themes, capture screenshots
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 30
+          target: default
+          arch: x86_64
+          ram-size: 1024M
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -skin 720x1280
+          disable-animations: true
+          script: |
+            mkdir -p screenshots
+            adb wait-for-device
+            adb logcat -c
+
+            echo "=== Installing agy-mobile-x86_64.apk ==="
+            adb install -r dist/agy-mobile-x86_64.apk
+
+            echo "=== Launching MainActivity ==="
+            adb shell am start -W -n dev.antigravity.mobile/.MainActivity
+            sleep 4
+            adb exec-out screencap -p > screenshots/01-terminal-dark.png
+
+            python3 - <<'PY'
+            import subprocess, time, xml.etree.ElementTree as ET, re
+
+            def dump_nodes():
+                subprocess.run(["adb", "shell", "uiautomator", "dump", "/sdcard/ui.xml"], check=True)
+                raw = subprocess.check_output(["adb", "shell", "cat", "/sdcard/ui.xml"]).decode("utf-8", "ignore")
+                root = ET.fromstring(raw)
+                out = []
+                for node in root.iter("node"):
+                    txt = node.attrib.get("text", "")
+                    desc = node.attrib.get("content-desc", "")
+                    cls = node.attrib.get("class", "")
+                    bounds = node.attrib.get("bounds", "")
+                    m = re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", bounds)
+                    if m:
+                        cx = (int(m.group(1)) + int(m.group(3))) // 2
+                        cy = (int(m.group(2)) + int(m.group(4))) // 2
+                        out.append((txt, desc, cls, cx, cy))
+                return out
+
+            def tap_match(substr):
+                nodes = dump_nodes()
+                for txt, desc, cls, cx, cy in nodes:
+                    if substr in txt or substr in desc:
+                        print(f"Tapping ({txt!r} / {desc!r}) at ({cx}, {cy})")
+                        subprocess.run(["adb", "shell", "input", "tap", str(cx), str(cy)], check=True)
+                        time.sleep(1.5)
+                        return
+                raise SystemExit(f"Could not find UI element matching {substr!r}. Available: {[(t, d) for t, d, _, _, _ in nodes if t or d]}")
+
+            # 1. Focus prompt EditText and execute /status + /mem
+            nodes = dump_nodes()
+            edit_nodes = [n for n in nodes if "EditText" in n[2]]
+            if not edit_nodes:
+                raise SystemExit("Prompt EditText not found")
+            _, _, _, ex, ey = edit_nodes[0]
+            subprocess.run(["adb", "shell", "input", "tap", str(ex), str(ey)], check=True)
+            time.sleep(0.8)
+            subprocess.run(["adb", "shell", "input", "text", "/status"], check=True)
+            time.sleep(0.8)
+            subprocess.run(["adb", "shell", "input", "keyevent", "4"], check=True) # hide soft keyboard if open
+            time.sleep(0.8)
+            tap_match("Run")
+            time.sleep(1.5)
+            subprocess.run("adb exec-out screencap -p > screenshots/02-terminal-status.png", shell=True, check=True)
+
+            # 2. Switch to Workspace screen & create a file
+            tap_match("Open Workspace screen")
+            subprocess.run("adb exec-out screencap -p > screenshots/03-workspace-dark.png", shell=True, check=True)
+
+            tap_match("New File")
+            subprocess.run(["adb", "shell", "input", "text", "README.txt"], check=True)
+            time.sleep(0.8)
+            tap_match("Create")
+            time.sleep(1.2)
+            subprocess.run("adb exec-out screencap -p > screenshots/04-workspace-editor.png", shell=True, check=True)
+            tap_match("Close")
+
+            # 3. Switch to Config screen
+            tap_match("Open Config screen")
+            subprocess.run("adb exec-out screencap -p > screenshots/05-config-dark.png", shell=True, check=True)
+
+            # 4. Toggle Light Paper theme & verify both Config and Terminal
+            tap_match("Switch between dark charcoal and light paper theme")
+            subprocess.run("adb exec-out screencap -p > screenshots/06-config-light-paper.png", shell=True, check=True)
+
+            tap_match("Open Terminal screen")
+            subprocess.run("adb exec-out screencap -p > screenshots/07-terminal-light-paper.png", shell=True, check=True)
+            PY
+
+            echo "=== Testing session & theme persistence across process termination ==="
+            adb shell am force-stop dev.antigravity.mobile
+            sleep 1
+            adb shell am start -W -n dev.antigravity.mobile/.MainActivity
+            sleep 3
+            adb exec-out screencap -p > screenshots/08-session-persisted-after-restart.png
+
+            echo "=== Testing Universal APK upgrade installation ==="
+            adb install -r dist/agy-mobile-universal.apk
+
+            echo "=== Checking logcat for any crashes ==="
+            if adb logcat -d | grep -E "FATAL EXCEPTION|UnsatisfiedLinkError|SIGSEGV"; then
+              echo "ERROR: Crash detected in logcat!" >&2
+              adb logcat -d | tail -n 80 >&2
+              exit 1
+            fi
+            ls -lh screenshots/*.png
+
+      - name: Upload live E2E screenshots
+        uses: actions/upload-artifact@v4
+        with:
+          name: agy-mobile-screenshots
+          path: screenshots/*.png
+          if-no-files-found: error

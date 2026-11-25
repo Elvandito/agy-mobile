@@ -1,0 +1,26 @@
+[package]
+name = "agy-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+agy-core.workspace = true
+agy-auth.workspace = true
+agy-terminal.workspace = true
+agy-workspace.workspace = true
+bytes.workspace = true
+flate2.workspace = true
+futures-util.workspace = true
+hex.workspace = true
+jni.workspace = true
+libc.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true

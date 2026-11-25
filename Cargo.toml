@@ -1,0 +1,72 @@
+[workspace]
+resolver = "2"
+members = [
+    ".",
+    "crates/agy-core",
+    "crates/agy-auth",
+    "crates/agy-terminal",
+    "crates/agy-workspace",
+    "crates/agy-runtime",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/Elvandito/agy-mobile"
+rust-version = "1.78"
+
+[workspace.dependencies]
+agy-core = { path = "crates/agy-core" }
+agy-auth = { path = "crates/agy-auth" }
+agy-terminal = { path = "crates/agy-terminal" }
+agy-workspace = { path = "crates/agy-workspace" }
+agy-runtime = { path = "crates/agy-runtime" }
+
+aes-gcm = "0.10"
+base64 = "0.22"
+bytes = "1.6"
+flate2 = { version = "1.0", default-features = false, features = ["rust_backend"] }
+futures-util = "0.3"
+hex = "0.4"
+jni = "0.21"
+libc = "0.2"
+rand = "0.8"
+reqwest = { version = "0.11", default-features = false, features = ["json", "stream", "rustls-tls-webpki-roots"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha1 = "0.10"
+sha2 = "0.10"
+thiserror = "1.0"
+tokio = { version = "1.38", default-features = false, features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "net", "process", "fs"] }
+url = "2.5"
+
+[package]
+name = "agy-mobile"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Native Rust Android client and compatibility runtime for Google Antigravity CLI"
+
+[dependencies]
+agy-core.workspace = true
+agy-auth.workspace = true
+agy-terminal.workspace = true
+agy-workspace.workspace = true
+agy-runtime.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+flate2.workspace = true
+sha1.workspace = true
+hex.workspace = true
+url.workspace = true
+
+[profile.release]
+opt-level = "s"
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
