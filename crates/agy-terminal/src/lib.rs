@@ -175,7 +175,14 @@ impl TerminalBuffer {
         for ch in chunk.chars() {
             if let Some(mut esc) = self.ansi_escape_buf.take() {
                 esc.push(ch);
-                if ('@'..='~').contains(&ch) {
+                let complete = if esc.starts_with('[') {
+                    esc.len() > 1 && ('@'..='~').contains(&ch)
+                } else if esc.starts_with(']') {
+                    ch == '\x07' || esc.ends_with("\x1b\\")
+                } else {
+                    true
+                };
+                if complete {
                     self.apply_csi_sequence(&esc);
                 } else if esc.len() < 32 {
                     self.ansi_escape_buf = Some(esc);
