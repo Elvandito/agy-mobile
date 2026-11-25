@@ -56,7 +56,8 @@ jobs:
           curl -fsSL https://github.com/bbqsrc/cargo-ndk/releases/download/v4.1.2/cargo-ndk-x86_64-unknown-linux-musl-v4.1.2.tgz | tar -xz -C "$RUNNER_TEMP/cndk"
           install -m 755 "$(find "$RUNNER_TEMP/cndk" -type f -name cargo-ndk | head -n 1)" "$CARGO_HOME/bin/cargo-ndk"
           echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
-          "$CARGO_HOME/bin/cargo-ndk" --version
+          export PATH="$CARGO_HOME/bin:$PATH"
+          cargo ndk --version
 
       - name: Run Rust unit and integration test suite
         run: cargo test --workspace -- --nocapture
