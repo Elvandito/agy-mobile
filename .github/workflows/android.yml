@@ -36,15 +36,19 @@ jobs:
       - name: Cache Cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install Android Platform 35, Build-Tools 35.0.0, and NDK r26d (API 21+)
+      - name: Configure Android SDK, Build-Tools 35.0.0, and NDK r26d (API 21+)
         run: |
-          yes | sdkmanager --licenses > /dev/null
-          sdkmanager "platforms;android-35" "build-tools;35.0.0" "ndk;26.3.11579264"
-          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/26.3.11579264" >> "$GITHUB_ENV"
-          echo "$ANDROID_HOME/build-tools/35.0.0" >> "$GITHUB_PATH"
+          SDK_ROOT="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          CMDLINE_BIN="$(ls -d "$SDK_ROOT"/cmdline-tools/*/bin | sort -V | tail -n 1)"
+          export PATH="$CMDLINE_BIN:$SDK_ROOT/platform-tools:$PATH"
+          yes | sdkmanager --sdk_root="$SDK_ROOT" --licenses > /dev/null || true
+          sdkmanager --sdk_root="$SDK_ROOT" "platform-tools" "platforms;android-35" "build-tools;35.0.0" "ndk;26.3.11579264"
+          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$SDK_ROOT/ndk/26.3.11579264" >> "$GITHUB_ENV"
+          echo "$CMDLINE_BIN" >> "$GITHUB_PATH"
+          echo "$SDK_ROOT/platform-tools" >> "$GITHUB_PATH"
+          echo "$SDK_ROOT/build-tools/35.0.0" >> "$GITHUB_PATH"
 
       - name: Install cargo-ndk
         run: |
@@ -122,52 +126,69 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
       - name: Download built APKs
         uses: actions/download-artifact@v4
         with:
           name: agy-mobile-apks
           path: dist
 
-      - name: Enable KVM on runner
+      - name: Enable KVM, boot Android 5.0 (API 21, 32-bit x86, 1024 MB RAM), install & verify
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
+          sudo chmod 666 /dev/kvm
 
-      - name: Boot Android 5.0 (API 21, 32-bit x86, 1024 MB RAM) and test APK
-        uses: reactivecircus/android-emulator-runner@v2
-        with:
-          api-level: 21
-          target: default
-          arch: x86
-          ram-size: 1024M
-          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -skin 480x800
-          disable-animations: true
-          script: |
-            mkdir -p screenshots-api21
-            adb wait-for-device
-            adb logcat -c
+          SDK_ROOT="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          CMDLINE_BIN="$(ls -d "$SDK_ROOT"/cmdline-tools/*/bin | sort -V | tail -n 1)"
+          export PATH="$CMDLINE_BIN:$SDK_ROOT/platform-tools:$SDK_ROOT/emulator:$PATH"
 
-            echo "=== Installing 32-bit agy-mobile-x86.apk on Android 5.0 (API 21) ==="
-            adb install -r dist/agy-mobile-x86.apk
+          yes | sdkmanager --sdk_root="$SDK_ROOT" --licenses > /dev/null || true
+          IMG="system-images;android-21;default;x86"
+          if ! sdkmanager --sdk_root="$SDK_ROOT" --list | grep -q "$IMG"; then
+            IMG="system-images;android-21;google_apis;x86"
+          fi
+          sdkmanager --sdk_root="$SDK_ROOT" "platform-tools" "emulator" "platforms;android-21" "$IMG"
 
-            echo "=== Launching MainActivity on API 21 ==="
-            adb shell am start -W -n dev.antigravity.mobile/.MainActivity
-            sleep 5
-            adb exec-out screencap -p > screenshots-api21/api21-32bit-terminal.png
+          echo "no" | avdmanager create avd --force --name agy_api21 --package "$IMG" --abi x86
+          mkdir -p screenshots-api21
 
-            echo "=== Triggering low-memory trim on 1 GB RAM API 21 device ==="
-            adb shell am send-trim-memory dev.antigravity.mobile RUNNING_CRITICAL || true
+          nohup "$SDK_ROOT/emulator/emulator" -avd agy_api21 -memory 1024 -no-window -gpu swiftshader_indirect -no-audio -no-boot-anim -no-snapshot -skin 480x800 > emulator21.log 2>&1 &
+          EMU_PID=$!
+
+          adb wait-for-device
+          for i in $(seq 1 90); do
+            booted="$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')"
+            if [ "$booted" = "1" ]; then break; fi
             sleep 2
+          done
+          sleep 4
+          adb shell input keyevent 82 || true
+          adb logcat -c
 
-            echo "=== Checking process is alive and crash-free on API 21 ==="
-            adb shell ps | grep dev.antigravity.mobile
-            if adb logcat -d | grep -E "FATAL EXCEPTION|UnsatisfiedLinkError|SIGSEGV"; then
-              echo "ERROR: Crash detected on Android API 21!" >&2
-              adb logcat -d | tail -n 80 >&2
-              exit 1
-            fi
-            ls -lh screenshots-api21/*.png
+          echo "=== Installing 32-bit agy-mobile-x86.apk on Android 5.0 (API 21, 1 GB RAM) ==="
+          adb install -r dist/agy-mobile-x86.apk
+          adb shell am start -W -n dev.antigravity.mobile/.MainActivity
+          sleep 5
+          adb exec-out screencap -p > screenshots-api21/api21-32bit-terminal.png
+
+          echo "=== Checking process and low-memory handling on API 21 ==="
+          adb shell ps | grep dev.antigravity.mobile
+          if adb logcat -d | grep -E "FATAL EXCEPTION|UnsatisfiedLinkError|SIGSEGV"; then
+            echo "ERROR: Crash detected on Android API 21!" >&2
+            adb logcat -d | tail -n 80 >&2
+            kill "$EMU_PID" || true
+            exit 1
+          fi
+
+          adb emu kill || kill "$EMU_PID" || true
+          ls -lh screenshots-api21/*.png
 
       - name: Upload API 21 screenshot artifact
         uses: actions/upload-artifact@v4
@@ -186,127 +207,151 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
       - name: Download built APKs
         uses: actions/download-artifact@v4
         with:
           name: agy-mobile-apks
           path: dist
 
-      - name: Enable KVM on runner
+      - name: Boot 1 GB RAM x86_64 Emulator, exercise all screens & themes, capture screenshots
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
+          sudo chmod 666 /dev/kvm
 
-      - name: Boot 1 GB RAM Emulator, exercise all screens & themes, capture screenshots
-        uses: reactivecircus/android-emulator-runner@v2
-        with:
-          api-level: 30
-          target: default
-          arch: x86_64
-          ram-size: 1024M
-          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -skin 720x1280
-          disable-animations: true
-          script: |
-            mkdir -p screenshots
-            adb wait-for-device
-            adb logcat -c
+          SDK_ROOT="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          CMDLINE_BIN="$(ls -d "$SDK_ROOT"/cmdline-tools/*/bin | sort -V | tail -n 1)"
+          export PATH="$CMDLINE_BIN:$SDK_ROOT/platform-tools:$SDK_ROOT/emulator:$PATH"
 
-            echo "=== Installing agy-mobile-x86_64.apk ==="
-            adb install -r dist/agy-mobile-x86_64.apk
+          yes | sdkmanager --sdk_root="$SDK_ROOT" --licenses > /dev/null || true
+          IMG="system-images;android-30;default;x86_64"
+          if ! sdkmanager --sdk_root="$SDK_ROOT" --list | grep -q "$IMG"; then
+            IMG="system-images;android-30;google_apis;x86_64"
+          fi
+          sdkmanager --sdk_root="$SDK_ROOT" "platform-tools" "emulator" "platforms;android-30" "$IMG"
 
-            echo "=== Launching MainActivity ==="
-            adb shell am start -W -n dev.antigravity.mobile/.MainActivity
-            sleep 4
-            adb exec-out screencap -p > screenshots/01-terminal-dark.png
+          echo "no" | avdmanager create avd --force --name agy_e2e --package "$IMG" --abi x86_64
+          mkdir -p screenshots
 
-            python3 - <<'PY'
-            import subprocess, time, xml.etree.ElementTree as ET, re
+          nohup "$SDK_ROOT/emulator/emulator" -avd agy_e2e -memory 1024 -no-window -gpu swiftshader_indirect -no-audio -no-boot-anim -no-snapshot -skin 720x1280 > emulator30.log 2>&1 &
+          EMU_PID=$!
 
-            def dump_nodes():
-                subprocess.run(["adb", "shell", "uiautomator", "dump", "/sdcard/ui.xml"], check=True)
-                raw = subprocess.check_output(["adb", "shell", "cat", "/sdcard/ui.xml"]).decode("utf-8", "ignore")
-                root = ET.fromstring(raw)
-                out = []
-                for node in root.iter("node"):
-                    txt = node.attrib.get("text", "")
-                    desc = node.attrib.get("content-desc", "")
-                    cls = node.attrib.get("class", "")
-                    bounds = node.attrib.get("bounds", "")
-                    m = re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", bounds)
-                    if m:
-                        cx = (int(m.group(1)) + int(m.group(3))) // 2
-                        cy = (int(m.group(2)) + int(m.group(4))) // 2
-                        out.append((txt, desc, cls, cx, cy))
-                return out
+          adb wait-for-device
+          for i in $(seq 1 90); do
+            booted="$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')"
+            if [ "$booted" = "1" ]; then break; fi
+            sleep 2
+          done
+          sleep 4
+          adb shell settings put global window_animation_scale 0 || true
+          adb shell settings put global transition_animation_scale 0 || true
+          adb shell settings put global animator_duration_scale 0 || true
+          adb shell input keyevent 82 || true
+          adb logcat -c
 
-            def tap_match(substr):
-                nodes = dump_nodes()
-                for txt, desc, cls, cx, cy in nodes:
-                    if substr in txt or substr in desc:
-                        print(f"Tapping ({txt!r} / {desc!r}) at ({cx}, {cy})")
-                        subprocess.run(["adb", "shell", "input", "tap", str(cx), str(cy)], check=True)
-                        time.sleep(1.5)
-                        return
-                raise SystemExit(f"Could not find UI element matching {substr!r}. Available: {[(t, d) for t, d, _, _, _ in nodes if t or d]}")
+          echo "=== Installing agy-mobile-x86_64.apk ==="
+          adb install -r dist/agy-mobile-x86_64.apk
+          adb shell am start -W -n dev.antigravity.mobile/.MainActivity
+          sleep 4
+          adb exec-out screencap -p > screenshots/01-terminal-dark.png
 
-            # 1. Focus prompt EditText and execute /status + /mem
-            nodes = dump_nodes()
-            edit_nodes = [n for n in nodes if "EditText" in n[2]]
-            if not edit_nodes:
-                raise SystemExit("Prompt EditText not found")
-            _, _, _, ex, ey = edit_nodes[0]
-            subprocess.run(["adb", "shell", "input", "tap", str(ex), str(ey)], check=True)
-            time.sleep(0.8)
-            subprocess.run(["adb", "shell", "input", "text", "/status"], check=True)
-            time.sleep(0.8)
-            subprocess.run(["adb", "shell", "input", "keyevent", "4"], check=True) # hide soft keyboard if open
-            time.sleep(0.8)
-            tap_match("Run")
-            time.sleep(1.5)
-            subprocess.run("adb exec-out screencap -p > screenshots/02-terminal-status.png", shell=True, check=True)
+          python3 - <<'PY'
+          import subprocess, time, xml.etree.ElementTree as ET, re
 
-            # 2. Switch to Workspace screen & create a file
-            tap_match("Open Workspace screen")
-            subprocess.run("adb exec-out screencap -p > screenshots/03-workspace-dark.png", shell=True, check=True)
+          def dump_nodes():
+              subprocess.run(["adb", "shell", "uiautomator", "dump", "/sdcard/ui.xml"], check=True)
+              raw = subprocess.check_output(["adb", "shell", "cat", "/sdcard/ui.xml"]).decode("utf-8", "ignore")
+              root = ET.fromstring(raw)
+              out = []
+              for node in root.iter("node"):
+                  txt = node.attrib.get("text", "")
+                  desc = node.attrib.get("content-desc", "")
+                  cls = node.attrib.get("class", "")
+                  bounds = node.attrib.get("bounds", "")
+                  m = re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", bounds)
+                  if m:
+                      cx = (int(m.group(1)) + int(m.group(3))) // 2
+                      cy = (int(m.group(2)) + int(m.group(4))) // 2
+                      out.append((txt, desc, cls, cx, cy))
+              return out
 
-            tap_match("New File")
-            subprocess.run(["adb", "shell", "input", "text", "README.txt"], check=True)
-            time.sleep(0.8)
-            tap_match("Create")
-            time.sleep(1.2)
-            subprocess.run("adb exec-out screencap -p > screenshots/04-workspace-editor.png", shell=True, check=True)
-            tap_match("Close")
+          def tap_match(substr):
+              nodes = dump_nodes()
+              for txt, desc, cls, cx, cy in nodes:
+                  if substr in txt or substr in desc:
+                      print(f"Tapping ({txt!r} / {desc!r}) at ({cx}, {cy})")
+                      subprocess.run(["adb", "shell", "input", "tap", str(cx), str(cy)], check=True)
+                      time.sleep(1.5)
+                      return
+              raise SystemExit(f"Could not find UI element matching {substr!r}. Available: {[(t, d) for t, d, _, _, _ in nodes if t or d]}")
 
-            # 3. Switch to Config screen
-            tap_match("Open Config screen")
-            subprocess.run("adb exec-out screencap -p > screenshots/05-config-dark.png", shell=True, check=True)
+          # 1. Focus prompt EditText and execute /status
+          nodes = dump_nodes()
+          edit_nodes = [n for n in nodes if "EditText" in n[2]]
+          if not edit_nodes:
+              raise SystemExit("Prompt EditText not found")
+          _, _, _, ex, ey = edit_nodes[0]
+          subprocess.run(["adb", "shell", "input", "tap", str(ex), str(ey)], check=True)
+          time.sleep(0.8)
+          subprocess.run(["adb", "shell", "input", "text", "/status"], check=True)
+          time.sleep(0.8)
+          subprocess.run(["adb", "shell", "input", "keyevent", "4"], check=True)
+          time.sleep(0.8)
+          tap_match("Run")
+          time.sleep(1.5)
+          subprocess.run("adb exec-out screencap -p > screenshots/02-terminal-status.png", shell=True, check=True)
 
-            # 4. Toggle Light Paper theme & verify both Config and Terminal
-            tap_match("Switch between dark charcoal and light paper theme")
-            subprocess.run("adb exec-out screencap -p > screenshots/06-config-light-paper.png", shell=True, check=True)
+          # 2. Switch to Workspace screen & create a file
+          tap_match("Open Workspace screen")
+          subprocess.run("adb exec-out screencap -p > screenshots/03-workspace-dark.png", shell=True, check=True)
 
-            tap_match("Open Terminal screen")
-            subprocess.run("adb exec-out screencap -p > screenshots/07-terminal-light-paper.png", shell=True, check=True)
-            PY
+          tap_match("New File")
+          subprocess.run(["adb", "shell", "input", "text", "README.txt"], check=True)
+          time.sleep(0.8)
+          tap_match("Create")
+          time.sleep(1.2)
+          subprocess.run("adb exec-out screencap -p > screenshots/04-workspace-editor.png", shell=True, check=True)
+          tap_match("Close")
 
-            echo "=== Testing session & theme persistence across process termination ==="
-            adb shell am force-stop dev.antigravity.mobile
-            sleep 1
-            adb shell am start -W -n dev.antigravity.mobile/.MainActivity
-            sleep 3
-            adb exec-out screencap -p > screenshots/08-session-persisted-after-restart.png
+          # 3. Switch to Config screen
+          tap_match("Open Config screen")
+          subprocess.run("adb exec-out screencap -p > screenshots/05-config-dark.png", shell=True, check=True)
 
-            echo "=== Testing Universal APK upgrade installation ==="
-            adb install -r dist/agy-mobile-universal.apk
+          # 4. Toggle Light Paper theme & verify both Config and Terminal
+          tap_match("Switch between dark charcoal and light paper theme")
+          subprocess.run("adb exec-out screencap -p > screenshots/06-config-light-paper.png", shell=True, check=True)
 
-            echo "=== Checking logcat for any crashes ==="
-            if adb logcat -d | grep -E "FATAL EXCEPTION|UnsatisfiedLinkError|SIGSEGV"; then
-              echo "ERROR: Crash detected in logcat!" >&2
-              adb logcat -d | tail -n 80 >&2
-              exit 1
-            fi
-            ls -lh screenshots/*.png
+          tap_match("Open Terminal screen")
+          subprocess.run("adb exec-out screencap -p > screenshots/07-terminal-light-paper.png", shell=True, check=True)
+          PY
+
+          echo "=== Testing session & theme persistence across process termination ==="
+          adb shell am force-stop dev.antigravity.mobile
+          sleep 1
+          adb shell am start -W -n dev.antigravity.mobile/.MainActivity
+          sleep 3
+          adb exec-out screencap -p > screenshots/08-session-persisted-after-restart.png
+
+          echo "=== Testing Universal APK upgrade installation ==="
+          adb install -r dist/agy-mobile-universal.apk
+
+          echo "=== Checking logcat for any crashes ==="
+          if adb logcat -d | grep -E "FATAL EXCEPTION|UnsatisfiedLinkError|SIGSEGV"; then
+            echo "ERROR: Crash detected in logcat!" >&2
+            adb logcat -d | tail -n 80 >&2
+            kill "$EMU_PID" || true
+            exit 1
+          fi
+
+          adb emu kill || kill "$EMU_PID" || true
+          ls -lh screenshots/*.png
 
       - name: Upload live E2E screenshots
         uses: actions/upload-artifact@v4
