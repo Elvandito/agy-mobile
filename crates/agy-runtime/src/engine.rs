@@ -1523,8 +1523,10 @@ impl AgyEngine {
             .sessions
             .load_recent_turns(&hdr.id, 20)
             .unwrap_or_default();
+        let has_credential = st.credential.is_some();
+        let compat = st.compat.clone();
         st.terminal.clear();
-        print_boot_banner(&mut st.terminal, &st.compat, st.credential.is_some());
+        print_boot_banner(&mut st.terminal, &compat, has_credential);
         for t in turns {
             let prefix = match t.role {
                 Role::User => "\x1b[1;33magy>\x1b[0m ",

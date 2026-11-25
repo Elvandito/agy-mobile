@@ -5,7 +5,7 @@ pub mod session;
 
 pub use compat::{
     assess_device_compatibility, AbiTarget, CompatibilityReport, DeviceInfo, ExecutionRuntime,
-    OfficialCliStatus, RuntimeSelection,
+    OfficialCliStatus, RuntimeSelection, OFFICIAL_ARM64_MANIFEST_URL,
 };
 pub use config::{AgentMode, AgyConfig, ModelSpec, PermissionPolicy, ThemeMode};
 pub use memory::{MemoryBudget, MemoryPressureLevel, MemoryProfile};
