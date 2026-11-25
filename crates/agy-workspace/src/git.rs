@@ -150,7 +150,7 @@ impl WorkspaceGit {
         if let Ok(index_map) = parse_git_index(&git_dir.join("index")) {
             let norm = rel_path.trim().trim_start_matches("./");
             if let Some(blob_sha) = index_map.get(norm) {
-                if let Ok((kind, old_bytes)) = read_loose_object(&git_dir, blob_sha) {
+                if let Ok((kind, old_bytes)) = read_loose_object(&git_dir, &hex::encode(blob_sha)) {
                     if kind == "blob" {
                         let old_text = String::from_utf8_lossy(&old_bytes);
                         let disk_path = workspace_root.join(norm);
@@ -332,7 +332,7 @@ fn read_loose_object(git_dir: &Path, oid_hex: &str) -> Result<(String, Vec<u8>),
         return Err("not_loose");
     }
     let file = File::open(obj_path).map_err(|_| "io")?;
-    let mut decoder = ZlibDecoder::new(file);
+    let decoder = ZlibDecoder::new(file);
     let mut raw = Vec::new();
     decoder
         .take(512 * 1024)
